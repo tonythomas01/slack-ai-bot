@@ -1,0 +1,143 @@
+from flask import Flask, request, jsonify
+import os
+import openai
+import json
+import hmac
+import hashlib
+import time
+import logging
+
+from openai import OpenAI
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+app = Flask(__name__)
+
+# Load secrets securely
+SLACK_SIGNING_SECRET = os.getenv("SLACK_SIGNING_SECRET")
+SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+if not SLACK_SIGNING_SECRET or not SLACK_BOT_TOKEN or not OPENAI_API_KEY:
+    logger.error("Missing required environment variables. Ensure secrets are loaded correctly.")
+    raise ValueError("Missing required environment variables. Ensure secrets are loaded correctly.")
+
+slack_client = WebClient(token=SLACK_BOT_TOKEN)
+
+def verify_slack_request(req):
+    """Verifies that the request comes from Slack."""
+    timestamp = req.headers.get("X-Slack-Request-Timestamp")
+    slack_signature = req.headers.get("X-Slack-Signature")
+
+    if not timestamp or not slack_signature:
+        logger.warning("Missing Slack signature or timestamp.")
+        return False
+
+    # Prevent replay attacks (requests older than 5 mins are rejected)
+    if abs(time.time() - int(timestamp)) > 300:
+        logger.warning("Possible replay attack detected.")
+        return False
+
+    # Create the Slack signature
+    sig_basestring = f"v0:{timestamp}:{req.get_data(as_text=True)}"
+    my_signature = "v0=" + hmac.new(
+        SLACK_SIGNING_SECRET.encode(),
+        sig_basestring.encode(),
+        hashlib.sha256
+    ).hexdigest()
+
+    if not hmac.compare_digest(my_signature, slack_signature):
+        logger.warning("Slack signature verification failed.")
+        return False
+
+    return True
+
+@app.route("/slack/actions", methods=["POST"])
+def handle_slack_action():
+    """Handles Slack message shortcut and interactive modals securely."""
+    if not verify_slack_request(request):
+        logger.warning("Unauthorized request received.")
+        return jsonify({"error": "Unauthorized"}), 403
+
+    try:
+        payload = json.loads(request.form["payload"])
+        logger.info(f"Received Slack action: {json.dumps(payload, indent=2)}")
+
+        # Case 1: User selects the message shortcut
+        if payload["type"] == "message_action":
+            trigger_id = payload["trigger_id"]
+            message_ts = payload["message"]["ts"]
+            channel_id = payload["channel"]["id"]
+
+            # Open a modal for user input
+            slack_client.views_open(
+                trigger_id=trigger_id,
+                view={
+                    "type": "modal",
+                    "callback_id": "ask_ai_modal",
+                    "title": {"type": "plain_text", "text": "Ask AI About It"},
+                    "blocks": [
+                        {
+                            "type": "input",
+                            "block_id": "user_question",
+                            "element": {"type": "plain_text_input", "action_id": "question_input"},
+                            "label": {"type": "plain_text", "text": "What do you want to ask?"}
+                        }
+                    ],
+                    "submit": {"type": "plain_text", "text": "Ask AI"},
+                    "private_metadata": json.dumps({"channel_id": channel_id, "message_ts": message_ts})
+                }
+            )
+
+        # Case 2: User submits the modal
+        elif payload["type"] == "view_submission":
+            view_data = payload["view"]
+            private_metadata = json.loads(view_data["private_metadata"])
+            channel_id = private_metadata["channel_id"]
+            message_ts = private_metadata["message_ts"]
+            user_question = view_data["state"]["values"]["user_question"]["question_input"]["value"]
+
+            # Fetch the thread messages
+            try:
+                response = slack_client.conversations_replies(channel=channel_id, ts=message_ts)
+                thread_messages = "\n".join([msg["text"] for msg in response["messages"]])
+            except SlackApiError as e:
+                logger.error(f"Failed to fetch thread messages: {e.response['error']}")
+                return jsonify({"error": f"Failed to fetch thread: {e.response['error']}"}), 500
+
+            # Generate AI response
+            prompt = f"Here's a Slack thread:\n{thread_messages}\n\nUser question: {user_question}\n\nProvide a helpful answer based on the context."
+            try:
+                client = OpenAI(api_key=OPENAI_API_KEY)
+                response = client.chat.completions.create(
+                    model="gpt-4",
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                ai_response = response.choices[0].message.content
+            except Exception as e:
+                logger.error(f"OpenAI API call failed: {str(e)}")
+                return jsonify({"error": "Failed to get AI response"}), 500
+
+            # Post AI response in the same thread
+            try:
+                slack_client.chat_postMessage(
+                    channel=channel_id,
+                    text=f"🤖 AI Response:\n{ai_response}",
+                    thread_ts=message_ts
+                )
+            except SlackApiError as e:
+                logger.error(f"Failed to post AI response: {e.response['error']}")
+                return jsonify({"error": "Failed to post AI response"}), 500
+
+    except Exception as e:
+        logger.exception("Unexpected error occurred")
+        return jsonify({"error": "Internal Server Error"}), 500
+
+    return jsonify({"status": "ok"})
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
