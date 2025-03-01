@@ -6,13 +6,14 @@ import hmac
 import hashlib
 import time
 import logging
+import threading
 
 from openai import OpenAI
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
 # Configure logging
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.ERROR)  # Log only errors
 logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
@@ -28,18 +29,17 @@ if not SLACK_SIGNING_SECRET or not SLACK_BOT_TOKEN or not OPENAI_API_KEY:
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
+
 def verify_slack_request(req):
     """Verifies that the request comes from Slack."""
     timestamp = req.headers.get("X-Slack-Request-Timestamp")
     slack_signature = req.headers.get("X-Slack-Signature")
 
     if not timestamp or not slack_signature:
-        logger.warning("Missing Slack signature or timestamp.")
         return False
 
     # Prevent replay attacks (requests older than 5 mins are rejected)
     if abs(time.time() - int(timestamp)) > 300:
-        logger.warning("Possible replay attack detected.")
         return False
 
     # Create the Slack signature
@@ -50,22 +50,51 @@ def verify_slack_request(req):
         hashlib.sha256
     ).hexdigest()
 
-    if not hmac.compare_digest(my_signature, slack_signature):
-        logger.warning("Slack signature verification failed.")
-        return False
+    return hmac.compare_digest(my_signature, slack_signature)
 
-    return True
+
+def process_ai_request(channel_id, message_ts, user_question, user_id):
+    """Runs AI processing in a separate thread."""
+    try:
+        response = slack_client.conversations_replies(channel=channel_id, ts=message_ts)
+        thread_messages = "\n".join([msg["text"] for msg in response["messages"]])
+    except SlackApiError as e:
+        logger.error(f"Failed to fetch thread messages: {e.response['error']}")
+        return
+
+    # Generate AI response
+    prompt = f"Here's a Slack thread:\n{thread_messages}\n\nUser question: {user_question}\n\nProvide a helpful answer based on the context."
+    try:
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        response = client.chat.completions.create(
+            model="gpt-4",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        ai_response = response.choices[0].message.content
+    except Exception as e:
+        logger.error(f"OpenAI API call failed: {str(e)}")
+        ai_response = "There was an error generating the response. Please try again later."
+
+    # Post AI response as an ephemeral message inside the thread
+    try:
+        slack_client.chat_postEphemeral(
+            channel=channel_id,
+            text=f"🤖 <@{user_id}>, here's your AI response:\n{ai_response}",
+            user=user_id,
+            thread_ts=message_ts
+        )
+    except SlackApiError as e:
+        logger.error(f"Failed to post AI response: {e.response['error']}")
+
 
 @app.route("/slack/actions", methods=["POST"])
 def handle_slack_action():
     """Handles Slack message shortcut and interactive modals securely."""
     if not verify_slack_request(request):
-        logger.warning("Unauthorized request received.")
         return jsonify({"error": "Unauthorized"}), 403
 
     try:
         payload = json.loads(request.form["payload"])
-        logger.info(f"Received Slack action: {json.dumps(payload, indent=2)}")
 
         # Case 1: User selects the message shortcut
         if payload["type"] == "message_action":
@@ -79,12 +108,12 @@ def handle_slack_action():
                 view={
                     "type": "modal",
                     "callback_id": "ask_ai_modal",
-                    "title": {"type": "plain_text", "text": "Ask AI About It"},
+                    "title": {"type": "plain_text", "text": "Ask AI about this thread"},
                     "blocks": [
                         {
                             "type": "input",
                             "block_id": "user_question",
-                            "element": {"type": "plain_text_input", "action_id": "question_input"},
+                            "element": {"type": "plain_text_input", "action_id": "question_input", "initial_value": "Summarize this thread"},
                             "label": {"type": "plain_text", "text": "What do you want to ask?"}
                         }
                     ],
@@ -100,44 +129,26 @@ def handle_slack_action():
             channel_id = private_metadata["channel_id"]
             message_ts = private_metadata["message_ts"]
             user_question = view_data["state"]["values"]["user_question"]["question_input"]["value"]
+            user_id = payload["user"]["id"]
 
-            # Fetch the thread messages
-            try:
-                response = slack_client.conversations_replies(channel=channel_id, ts=message_ts)
-                thread_messages = "\n".join([msg["text"] for msg in response["messages"]])
-            except SlackApiError as e:
-                logger.error(f"Failed to fetch thread messages: {e.response['error']}")
-                return jsonify({"error": f"Failed to fetch thread: {e.response['error']}"}), 500
+            # Send an immediate response to avoid Slack timeout
+            slack_client.chat_postEphemeral(
+                channel=channel_id,
+                text="✅ We received your question! AI is thinking... You'll get a response soon.",
+                user=user_id,
+                thread_ts=message_ts
+            )
 
-            # Generate AI response
-            prompt = f"Here's a Slack thread:\n{thread_messages}\n\nUser question: {user_question}\n\nProvide a helpful answer based on the context."
-            try:
-                client = OpenAI(api_key=OPENAI_API_KEY)
-                response = client.chat.completions.create(
-                    model="gpt-4",
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                ai_response = response.choices[0].message.content
-            except Exception as e:
-                logger.error(f"OpenAI API call failed: {str(e)}")
-                return jsonify({"error": "Failed to get AI response"}), 500
-
-            # Post AI response in the same thread
-            try:
-                slack_client.chat_postMessage(
-                    channel=channel_id,
-                    text=f"🤖 AI Response:\n{ai_response}",
-                    thread_ts=message_ts
-                )
-            except SlackApiError as e:
-                logger.error(f"Failed to post AI response: {e.response['error']}")
-                return jsonify({"error": "Failed to post AI response"}), 500
+            # Run the AI processing in a separate thread
+            threading.Thread(target=process_ai_request, args=(channel_id, message_ts, user_question, user_id)).start()
+            return jsonify({"response_action": "clear"}), 200
 
     except Exception as e:
-        logger.exception("Unexpected error occurred")
+        logger.error("Unexpected error occurred", exc_info=True)
         return jsonify({"error": "Internal Server Error"}), 500
 
     return jsonify({"status": "ok"})
+
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=8080)
