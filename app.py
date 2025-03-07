@@ -1,3 +1,5 @@
+from http.server import DEFAULT_ERROR_MESSAGE
+
 from flask import Flask, request, jsonify
 import os
 import openai
@@ -29,6 +31,9 @@ if not SLACK_SIGNING_SECRET or not SLACK_BOT_TOKEN or not OPENAI_API_KEY:
 
 slack_client = WebClient(token=SLACK_BOT_TOKEN)
 
+DEFAULT_ERROR_MESSAGE = ("⚠️ There was an error processing your request. Please make sure that @Ask AI bot"
+                         " is invited in this channel before trying again. "
+                         "You can easily invite the bot by writing `/invite @Ask AI` in this channel.")
 
 def verify_slack_request(req):
     """Verifies that the request comes from Slack."""
@@ -53,6 +58,19 @@ def verify_slack_request(req):
     return hmac.compare_digest(my_signature, slack_signature)
 
 
+def notify_user_on_thread_on_error(channel_id, message_ts, user_id, error_text=DEFAULT_ERROR_MESSAGE):
+    """Posts an error message in the thread."""
+    try:
+        slack_client.chat_postEphemeral(
+            channel=channel_id,
+            text=error_text,
+            user=user_id,
+            thread_ts=message_ts
+        )
+    except SlackApiError as e:
+        logger.error(f"Failed to post error message: {e.response['error']}")
+
+
 def process_ai_request(channel_id, message_ts, user_question, user_id):
     """Runs AI processing in a separate thread."""
     try:
@@ -60,6 +78,7 @@ def process_ai_request(channel_id, message_ts, user_question, user_id):
         thread_messages = "\n".join([msg["text"] for msg in response["messages"]])
     except SlackApiError as e:
         logger.error(f"Failed to fetch thread messages: {e.response['error']}")
+        notify_user_on_thread_on_error(channel_id, message_ts, user_id=user_id)
         return
 
     # Generate AI response
@@ -73,6 +92,7 @@ def process_ai_request(channel_id, message_ts, user_question, user_id):
         ai_response = response.choices[0].message.content
     except Exception as e:
         logger.error(f"OpenAI API call failed: {str(e)}")
+        notify_user_on_thread_on_error(channel_id, message_ts, user_id=user_id, error_text="⚠️ We could not talk to ChatGPT. Please try again later.")
         ai_response = "There was an error generating the response. Please try again later."
 
     # Post AI response as an ephemeral message inside the thread
@@ -84,6 +104,7 @@ def process_ai_request(channel_id, message_ts, user_question, user_id):
             thread_ts=message_ts
         )
     except SlackApiError as e:
+        notify_user_on_thread_on_error(channel_id, message_ts, user_id=user_id)
         logger.error(f"Failed to post AI response: {e.response['error']}")
 
 
@@ -138,11 +159,18 @@ def handle_slack_action():
                 user=user_id,
                 thread_ts=message_ts
             )
-
             # Run the AI processing in a separate thread
             threading.Thread(target=process_ai_request, args=(channel_id, message_ts, user_question, user_id)).start()
             return jsonify({"response_action": "clear"}), 200
 
+    except SlackApiError as e:
+        logger.error(f"Slack API error occurred: {e.response['error']}")
+        return jsonify({
+            "response_action": "errors",
+            "errors": {
+                "user_question": "⚠️ The app may not be in this channel. Please invite it before using this feature."
+            }
+        }), 200
     except Exception as e:
         logger.error("Unexpected error occurred", exc_info=True)
         return jsonify({"error": "Internal Server Error"}), 500
