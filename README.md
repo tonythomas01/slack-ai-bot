@@ -29,7 +29,7 @@ This is a Flask-based Slack bot that integrates with OpenAI's GPT-4 to provide A
 
 ### 2️⃣ Clone the Repository
 ```bash
-git clone https://github.com/your-username/ask-ai-slack-bot.git
+git clone https://github.com/tonythomas01/slack-ai-bot.git
 cd ask-ai-slack-bot
 ```
 
@@ -111,10 +111,6 @@ Ensure your Slack app has the following::
 4. Push to the branch: `git push origin feature-new-feature`.
 5. Submit a pull request.
 
----
-
-## 📜 License
-MIT License
 
 ---
 
@@ -124,4 +120,4 @@ Developed with ❤️ using **Flask**, **Slack SDK**, and **OpenAI API**.
 ---
 
 ## 📩 Questions or Issues?
-Open an issue on [GitHub Issues](https://github.com/your-username/ask-ai-slack-bot/issues) or reach out via Slack!
+Open an issue on [GitHub Issues](https://github.com/tonythomas01/slack-ai-bot/issues) or reach out via Slack!
